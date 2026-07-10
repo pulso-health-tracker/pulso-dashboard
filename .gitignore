@@ -5,3 +5,11 @@ __pycache__/
 *.pyc
 .venv/
 db.sqlite3
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
