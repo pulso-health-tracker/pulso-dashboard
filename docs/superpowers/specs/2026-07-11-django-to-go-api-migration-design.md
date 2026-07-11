@@ -2,18 +2,23 @@
 
 ## 1. Objective
 
-Replace the Django backend in `pulso-dashboard` with a new standalone Go API repo (`pulso-api`), and reduce `pulso-dashboard` to a static frontend that talks to it over HTTP. This is the first of two sequential migrations toward the target stack (Go API + Next.js frontend) — the Next.js swap is a separate, later plan that will consume `pulso-api` once it exists.
+Stand up a new standalone Go API repo (`pulso-api`) that reproduces the 3 metrics endpoints Django currently serves, as a **contract-compatible drop-in replacement**. This repo is created in isolation — it does not touch `pulso-dashboard` (Django+Vite) at all.
 
 ## 2. Motivation & Sequencing
 
-The user wants to move off Python/Django for the dashboard's backend, replacing it with Go, and separately wants to move the frontend from Vite+React to Next.js. The two are sequenced: Go API first, then Next.js — because the Next.js plan will build against a stable `pulso-api` rather than Django's soon-to-be-retired endpoints. This spec covers only the Go API migration and the minimal frontend changes needed to keep the current React app working against it in the interim.
+The user wants to move off Python/Django for the dashboard's backend (Go) and, separately, off Vite+React for the frontend (Next.js). These two migrations now run **concurrently**, each as an independent agent/workstream, to avoid one waiting on the other:
+
+- **Agent 1 (this spec):** builds `pulso-api` from scratch. Touches only the new repo.
+- **Agent 2** (separate spec, `2026-07-11-nextjs-frontend-migration-design.md`): builds a new `pulso-web` (Next.js) repo from scratch, developing against the *existing, still-running* Django API (same contract `pulso-api` will expose) so it has something real to call without waiting on Agent 1.
+
+Neither agent modifies `pulso-dashboard` — it keeps running exactly as-is (Django + Vite/React, own Postgres connection) as the live reference implementation and the thing both new repos are measured against, until both `pulso-api` and `pulso-web` are done and verified. Only then is `pulso-dashboard` retired (archived, same treatment as the original monorepo).
 
 ## 3. Target Repositories
 
 | Repo | Change |
 |---|---|
 | `pulso-health-tracker/pulso-api` (new) | Go + Echo + GORM, hosts the 3 metrics endpoints |
-| `pulso-health-tracker/pulso-dashboard` (existing) | Django removed entirely; becomes a static Vite+React build served by nginx, calling `pulso-api` cross-origin |
+| `pulso-health-tracker/pulso-dashboard` (existing) | **Untouched by this spec.** Stays as Django + Vite/React, fully functional, until both `pulso-api` and `pulso-web` are ready — see §7. |
 
 No changes to `pulso-health-tracker/pulso-etl` — it remains the sole owner of the Postgres schema and migrations. Both `pulso-api` and the ETL read/write the same database; `pulso-api` is read-only.
 
@@ -51,44 +56,27 @@ Same 3 routes, same query params (`start`, `end`, `YYYY-MM-DD`, both optional), 
 
 No `index`/HTML route — `pulso-api` is API-only, no template rendering.
 
-## 5. `pulso-dashboard`
-
-### 5.1 Removed
-
-`dashboard_project/`, `apps/`, `manage.py`, `requirements.txt`, `conftest.py`, `pytest.ini`, the Django `Dockerfile`, `django-vite` (package.json dependency and `apps/analytics/templates/`).
-
-### 5.2 Frontend Build Changes
-
-- `vite.config.js`: drop `root: "frontend"` + manifest-based django-vite output (`outDir: "static"`, `manifest: true`). Standard Vite SPA build instead (`outDir: "dist"`), with a new `frontend/index.html` entry point (replacing the Django template `apps/analytics/templates/analytics/index.html`, which used `{% vite_asset %}` tags) — the `<div id="chart-root">` and a `<script type="module" src="/src/main.jsx">` move into this new static HTML file.
-- New `frontend/src/config.js` exporting `API_BASE_URL` read from `import.meta.env.VITE_API_BASE_URL` (Vite build-time env var).
-- Six existing relative-path `fetch` call sites are updated to prefix with `API_BASE_URL`:
-  - `Dashboard.jsx`: 3 inline `fetch("/api/metrics/...")` calls (stat cards)
-  - `useChartData.js`: the shared hook used by `EnergyChart`, `WorkoutVolumeChart`, `TopRecordTypesChart`
-
-### 5.3 Docker & Compose
-
-- New Dockerfile: `node:20-alpine` build stage (`npm ci && npm run build`) → `nginx:alpine` runtime stage serving `dist/`.
-- New `docker-compose.yml`: single `dashboard` service (nginx), build arg `VITE_API_BASE_URL` pointing at `pulso-api`. No more `DB_*`, `SECRET_KEY`, `DJANGO_SETTINGS_MODULE`, `DEBUG` — the frontend no longer touches Postgres or Django settings at all.
-
-### 5.4 CI
-
-- `tests.yml`: unchanged — still just the `frontend-test` job (`npm ci && npm test`, vitest). The pre-existing gap (no backend test job) becomes moot since there's no backend left in this repo.
-- `docker.yml`: updated to build the new nginx-based Dockerfile instead of the old Django one; drop the `docker-compose` validation job's Postgres/Django-specific assumptions (compose now only has one static-serving service).
-
-### 5.5 README
-
-Rewritten to describe the new architecture: static frontend, no local database of its own, depends on `pulso-api` running separately (with its own Postgres, provided by `pulso-etl`). Quick Start becomes: run `pulso-etl`'s compose, run `pulso-api`, then `docker compose up --build` here with `VITE_API_BASE_URL` pointing at it.
-
-## 6. Local Dev Workflow (Three Repos Together)
+## 5. Local Dev Workflow (Verifying `pulso-api` Standalone)
 
 1. `pulso-etl`'s compose provides Postgres (+ schema/data).
 2. `pulso-api` connects to that Postgres (same `DB_*` env var convention already established) and serves the 3 endpoints on its own port (e.g. `:8080`).
-3. `pulso-dashboard`'s compose builds with `VITE_API_BASE_URL=http://localhost:8080` and serves the SPA, which calls `pulso-api` cross-origin (CORS-enabled for the dashboard's origin).
+3. Verification: hit `pulso-api`'s 3 endpoints directly (`curl`) and diff the JSON against the same request made to the still-running `pulso-dashboard` Django API, for the same date range — the two must return byte-identical JSON (modulo key order). This is the acceptance check for "contract-compatible," not just "returns some JSON."
+
+## 6. Cutover — When Both Parallel Migrations Are Done
+
+Once `pulso-api` (this spec) and `pulso-web` (the Next.js spec) are both built and independently verified:
+
+1. Point `pulso-web` at `pulso-api` instead of the Django API it was developed against (a config/env var change only — the contract is identical, per §5's verification step).
+2. Confirm `pulso-web` + `pulso-api` together reproduce what `pulso-dashboard` does today (same manual check as the two-repo verification done for `pulso-etl` + `pulso-dashboard` earlier in this project).
+3. Archive `pulso-dashboard` (Django + Vite/React), same treatment as the original monorepo: README replaced with a pointer notice to `pulso-api` and `pulso-web`, repo archived.
+
+This step is out of scope for both individual specs — it's a separate, small integration task once both land.
 
 ## 7. Out of Scope
 
-- **Next.js migration** — separate, later plan. Will replace `pulso-dashboard`'s Vite+React frontend with Next.js, consuming this same `pulso-api` unchanged.
-- **AWS deployment architecture** — the existing AWS spec (`docs/superpowers/specs/2026-07-09-aws-native-architecture-design.md` in the former monorepo) assumed a single Django container on ECS; this migration invalidates that shape (now two independently-deployable pieces: a Go API and a static site). Revising that spec is not part of this plan — flagged here as a known follow-up.
+- **Building `pulso-web` (Next.js)** — separate, concurrent spec (`2026-07-11-nextjs-frontend-migration-design.md`). This spec only produces `pulso-api`.
+- **Any changes to `pulso-dashboard`** — stays untouched until §6's cutover.
+- **AWS deployment architecture** — the existing AWS spec (`docs/superpowers/specs/2026-07-09-aws-native-architecture-design.md` in the former monorepo) assumed a single Django container on ECS; once `pulso-api` + `pulso-web` replace it, that shape is invalidated (now two independently-deployable pieces: a Go API and a Next.js app). Revising that spec is not part of this plan — flagged here as a known follow-up.
 - **Authentication** — no auth today, none added here.
 - **Database schema changes** — `pulso-api` is strictly read-only against the existing schema; no migrations, no new tables.
 - **SQL-side aggregation rewrite** — deferred; the mechanical port preserves today's in-application grouping behavior exactly.
